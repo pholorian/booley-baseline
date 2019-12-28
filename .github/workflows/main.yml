@@ -1,0 +1,565 @@
+program booley_baseline
+! plots stacked booley profiles
+! extracts holdfast length versus amplitude depression
+
+! pre-process files with booley-pre.sh
+  
+!! 2017 version that finds bulge using splines as well as linear fit
+!! modified 12/19 to use 15mm bins
+  
+!!$LOGIC:
+!!$If the algal mat has a constant effective elastic thickness
+!!$then the wavelength of teh flexural bulge should be constant,
+!!$so stacking curves ar the nadir, which wshould be the point
+!!$of maximum load should produce an averaged profile for this
+!!$deflection, the amplitude will not be correct, but the
+!!$half wavelength depends on the elastic properties of the
+!!$mat and should, on the above assumption, be constant.
+!!$So we must align horizontally (x) the profiles at the nadirs of the fossils.
+!!$The deflection should be measured from the the start of the fossil, arguably
+!!$the pivot point of the model, so the heights (y) should be aligned at the start
+!!$of the fossil.
+!!$We then need a separate plot of heights (start to nadir) versus distance
+!!$from start to nadir to see if size of deflection is proportional to the size
+!!$of the holdfast.
+
+!!$  Maps fossil to a baseline joining START FOSSIL to END FOSSIL, uses this line as base (y=0)
+!!$  and x = distance along line from START FOSSIL and y = distance to line (+ve) = above
+!!$  Then finds nadir and cuts out points after nadir.  these points are then futted to a 3rd oreder
+!!$  ploynomial which is differentiated to find maximum. If maximum withoin data set this is identified as flexural bulge.
+  use fitting
+  implicit none
+  integer, parameter                :: dp=selected_real_kind(15, 307)   ! double precision
+  integer, parameter                :: degree=3  ! degree of flexure fitting  polynomial  NB code to calculate y assumes order 3, gives 4 powers
+  integer, parameter                :: fmax=400  !number of fossils (fosss) (1,fi)
+  integer, parameter                :: cmax=400 ! number of column heights (columns) (1,ci)
+  
+  !!
+  real(dp), dimension(1:degree+1)    :: a           !matrix for same, lowest order first (a(0)=d,a(3)=ax^3
+  real(dp), dimension(fmax,cmax)     :: xx,yy,newyy,newxx  !various required by program
+  real(dp), dimension(cmax)          :: smoothyy,smoothxx,bulgexx,bulgeyy,linfitxx,linfityy
+  !! these must be set to exact length of vector for each call to polyfit
+  real(dp),dimension(:),allocatable  :: flexxx,flexyy
+  !  real(dp), dimension(250)          :: wavelen
+  real(dp), dimension(1:6)           :: bin_mid = (/15.0,30.0,45.0,60.0,75.0,90.0/) !! bin sizes for smoothing
+  real(dp), dimension(1:6)           :: end_stacked, begin_stacked !! mean start & end for each stack
+  real(dp), dimension(1:6)           :: mean_rad_stacked, mean_bulge_stacked, mean_flex_stacked !! mean radius, Xb & maxflex for each stack
+  real(dp), dimension(cmax)          :: holdfast_radius,flex_slope
+  character(len=10), dimension(fmax) :: specimen
+  integer, dimension(fmax,cmax)      :: fossil
+  integer, dimension(fmax)           :: cols,nadirs,begin_fossil,end_fossil
+  integer, dimension(fmax)           :: smoothnn
+  integer, dimension(1:6)            :: stacked,ibulge
+  real(dp)                          :: x,y,sum=0.0,min=1000000.0,nspecs,nn,d2r=57.29578,minm=1.00D00
+  real(dp)                          :: min_slope=3.0D-01,rstep=7.5
+  real(dp)                          :: radius,angle,minrad,maxrad,m,konst,tiny=1.0e-10,ptx,pty,cc
+  real(dp)                          :: nadir_x_zero,qa,qb,qc,dx1,dx2,ddx1,ddx2,extrap_mm=0.0D00
+  real(dp)                          :: sumx,sumxx,sumxy,sumy,m1,m2,bulge_xmax,bulge_ymax,peakyy
+  integer                           :: i,k,foss=0,col=1,ierror,flag,fi,ci,ix,im=1,iline=16,ioffset=5,excluded=0
+  integer                           :: ibegin,iend,iwindow=4,mincol,infos,irad,iflex
+  character(len=10)                 :: loc
+  logical                           :: nadir,lhs,bulge
+  
+  nadir=.TRUE.   ! are these needed??
+  lhs=.FALSE.
+  bulge=.FALSE.
+  !!########################################!!
+  !!!!!!!!!!!!! READ FILES !!!!!!!!!!!!!!!!!
+  !!########################################!!
+  ! read input and open output files
+  open (10, file="booley.dat",iostat=ierror)
+  ! output files for various plots
+  open (12, file="./tmp/smooth.txt")
+  open (13, file="./tmp/holdfast_ang.txt")
+  open (14, file="./tmp/holdfast_len.txt")
+  open (15, file="./tmp/wavelength_poly.txt") 
+  open (21, file="./tmp/booley_pre.txt")
+  open (22, file="./tmp/booley_fossil.txt")
+  open (23, file="./tmp/booley_post.txt")
+  open (24, file="./tmp/start-nadir-bulge.txt")
+  open (25, file="./tmp/plot-wrt-foss.txt")
+  open (26, file="./tmp/plot-wrt-nadr.txt")
+  open (27, file="./tmp/plot_flex_curve.txt")
+  open (28, file="./tmp/plot_line_fit.txt")
+  open (29, file="./tmp/wavelength_line.txt")
+  open (30, file="./tmp/poly_lin.txt")
+  
+  write (27,1010)
+  write (28,1010)
+
+!! smoothed profiles for various radii
+!!$open (30, file="smooth00.txt")
+!!$open (31, file="smooth10.txt")
+!!$open (32, file="smooth20.txt")
+!!$open (33, file="smooth30.txt")
+!!$open (34, file="smooth40.txt")
+!!$open (35, file="smooth50.txt")
+  if ( ierror /= 0 ) then
+     print*, "Failed to open booley.dat!"
+     stop 
+  end if
+
+  ! set at first col of first foss
+  foss=0
+  col=0
+  readfile : do    !read file until end
+     read (unit=10,fmt=*,iostat=ierror) x,y,flag,loc
+     if (ierror < 0 ) then 
+        print*, "file booley.dat read" 
+        exit readfile
+     else if (ierror > 0) then   !report errors
+        print*, "Error during read" 
+        exit readfile
+     end if
+     ! for first column of a given fossil
+     if ( (abs(x) < tiny).and.(abs(y) < tiny) ) then   !if x=0.0,y=0.0 marks first line new fossil
+        ! record name
+        if (foss  > 0) then    !don't save until first fossil read and fosss incremented
+           cols(foss)=col-1    !save number of columns in previous foss
+        end if
+        foss=foss+1          !new foss means new fossil  
+        col=0              !column 1 reset to start of new foss
+        specimen(foss)=loc
+     end if
+     if (col > 0 ) then 
+        xx(foss,col)=x
+        yy(foss,col)=y
+        fossil(foss,col)=flag
+     end if
+     col=col+1
+     !debug print *,x,y,flag,loc,foss,col-1,cols(foss-1)
+  end do readfile
+  nspecs=real(foss)
+  !debug print *,nspecs
+  ! record last fossil
+  cols(foss)=col-1
+  !! header for results output to screen
+  write (*,1065)
+  !!########################################!!
+  !!!!!!!!!!! END READ FILES !!!!!!!!!!!!!!!
+  !!########################################!!
+
+  !!########################################!!
+  !!!!!!!!!!! PROCESS FOSSS !!!!!!!!!!!!!!!
+  !!########################################!!
+  ! process each fossil (foss)
+  processfoss : do fi=1,foss
+     begin_fossil(fi)=1       !set begin fossil to 1 in case no start of fossil recorded
+     end_fossil(fi)=cols(fi)  !set end fossil to end of data
+     ! find start of fossil
+     start_fossil :  do ci = 2,cols(fi)
+        if (fossil(fi,ci) == 1) then
+           begin_fossil(fi)=ci        !first line is flag set at zero so subtract 1 from ci
+           exit start_fossil
+        end if
+     end do start_fossil
+     ! find end of fossil
+     finish_fossil :  do ci = 2,cols(fi)
+        if (fossil(fi,ci) == -1) then
+           end_fossil(fi)=ci-1        !first line is flag set at zero so subtract 2 from ci
+           exit finish_fossil
+        end if
+     end do finish_fossil
+     !!########################################!!
+     !!!!!!!!!!! MAP TO BASELINE !!!!!!!!!!!!!!!
+     !!########################################!!
+     ! Now define fossil reference line
+     ! Find start coords, calculate line y=mx+k (see pt2line.awk for more info)
+     ibegin=begin_fossil(fi)
+     iend=end_fossil(fi)
+     ! Now compute line
+     ! slope
+     m=(yy(fi,ibegin)-yy(fi,iend)) / (xx(fi,ibegin)-xx(fi,iend))
+     ! Konstant
+     konst=yy(fi,ibegin)-m*xx(fi,ibegin)
+     cc=cos(atan(m))
+     
+     ! Now zero profile using baseline: newyy=perp distance; newxx=xx(perp to point)-xx(istart)
+     zero_XY : do ci=2,cols(fi)
+        ! distance from point to line
+        newyy(fi,ci)=(konst+m*xx(fi,ci)-yy(fi,ci))/sqrt(1.0+m*m)
+        ! nearest point on baseline
+        pty=yy(fi,ci)+newyy(fi,ci)*cc
+        ptx=(pty-konst)/m
+        ! zero line so X = 0 = start fossil
+        newxx(fi,ci)=(ptx-xx(fi,ibegin))*cc
+        !change sign so above line positive
+        newyy(fi,ci)=-newyy(fi,ci)
+        if (ci == 2) then
+           write (25,1010)
+        end if
+        write (25,2500) newxx(fi,ci),newyy(fi,ci)
+     end do zero_XY
+     !!########################################!!
+     !!!!!!!!!!! END BASELINE !!!!!!!!!!!!!!!
+     !!########################################!!
+
+     !!########################################!!
+     !!!!!!!!!!! FIND NADIR !!!!!!!!!!!!!!!
+     !!########################################!!
+     ! find minimum in fossil part of curve 
+        min=1000000.0
+        mincol=0
+     minimum : do ci=2,cols(fi)-(iwindow-1)
+        infos=0
+        sum=0.0
+        ! move window along profile
+        do k=ci,ci+iwindow-1
+           sum=sum+newyy(fi,k)
+           infos=infos + fossil(fi,k)   !check it is in the fossil
+        end do
+        ! record nadir
+        if ((sum < min).and.(infos == iwindow)) then
+           min=sum
+           mincol=ci + iwindow/2 -1
+        end if
+     end do minimum
+     nadirs(fi)=mincol
+     !debug print *,fi,nadirs(fi),newyy(fi,nadirs(fi)),newxx(fi,nadirs(fi))
+     !!########################################!!
+     !!!!!!!!!!! END NADIR !!!!!!!!!!!!!!!
+     !!########################################!!
+
+     !!########################################!!
+     !!!!!!!!!!! ALIGN X TO NADIR !!!!!!!!!!!!!!!
+     !!########################################!!
+     ! adjust X so zero value is at nadir, not start of fossil
+     nadir_x_zero=newxx(fi,nadirs(fi))
+     aligncols : do ci = 2,cols(fi)
+        newxx(fi,ci)=newxx(fi,ci)-nadir_x_zero
+        if (ci == 2) then
+           write (26,1010)
+        end if
+        write (26,2500) newxx(fi,ci),newyy(fi,ci)
+     end do aligncols
+     !debug print *,cols(fi)
+     !!########################################!!
+     !!!!!!!!!!! END ALIGN X !!!!!!!!!!!!!!!
+     !!########################################!!
+
+     !!########################################!!
+     !!!!!!!!!!! POLYFIT POST NADIR !!!!!!!!!!!!!!!
+     !!########################################!!
+     !! get vector size
+     iflex=cols(fi)-nadirs(fi)+1
+     !! now allocate vectors
+     allocate(flexxx(iflex))
+     allocate(flexyy(iflex))
+     
+     !! select post-nadir data
+     postnad : do ci=nadirs(fi),cols(fi)
+        ix=ci-nadirs(fi)+1
+        flexxx(ix)=newxx(fi,ci)
+        flexyy(ix)=newyy(fi,ci)
+!!$        if (fi == 1) then
+!!$           print *,flexxx(ix),flexyy(ix)
+!!$        end if
+     end do postnad
+
+     ! now feed to polynomial fitting.f90 routine.  It allocates memory.
+     a = polyfit(flexxx, flexyy, degree)
+
+     !! 6/11/17 HERE try 4th degree polynomial, forget ddx
+     !write out (handle=27) flex curve from x=0,x=100 for plotting
+     ! write name
+     do ci = 0,100
+        x=real(ci)
+        y=a(4)*x*x*x + a(3)*x*x + a(2)*x + a(1)
+        write (27,2500) x,y
+     end do
+     !closing >
+     write (27,1010)
+     
+     !differentiate and get a,b,c for quadratic
+     qa=3.0D00*a(4)
+     qb=2.0D00*a(3)
+     qc=a(2)
+
+     !find roots of dy/dx=0
+     dx1=(-qb-sqrt(qb*qb-4.0D00*qa*qc)) / (2.0D00*qa)
+     dx2=(-qb+sqrt(qb*qb-4.0D00*qa*qc)) / (2.0D00*qa)
+
+     !sign of ddy/ddx.  Note qa & qb not a(4) and a(3) 
+     ddx1=2.0D00*qa*dx1+qb
+     ddx2=2.0D00*qa*dx2+qb
+
+     ! find maximum (ddy/ddx=-ve) provided roots found for diffrentiation quadratic
+     if ( isnan(dx1).or.isnan(dx2) ) then
+        bulgexx(fi)=-1.0D10
+        bulgeyy(fi)=-1.0D10
+     else
+        if (ddx1 < 0.0D00) then
+           bulgexx(fi)=dx1
+           bulgeyy(fi)=a(4)*dx1*dx1*dx1 + a(3)*dx1*dx1 + a(2)*dx1 + a(1)
+        else
+           bulgexx(fi)=dx2
+           bulgeyy(fi)=a(4)*dx2*dx2*dx2 + a(3)*dx2*dx2 + a(2)*dx2 + a(1)
+        end if
+     end if
+     !set to effective zero if out of data range
+     ! 1" beyond max X
+     bulge_xmax=newxx(fi,cols(fi)) + extrap_mm
+     bulge_ymax=1.0D02
+     if (abs(bulgexx(fi)) > bulge_xmax) bulgexx(fi)= -1.01D02
+     if (abs(bulgeyy(fi)) > bulge_ymax) bulgeyy(fi)=-1.01D02
+     !!########################################!!
+     !!!!!!!!!!! END POLYFIT POST NADIR !!!!!!!!!!!!!!!
+     !!########################################!!
+
+     
+     !!########################################!!
+     !!  FIND DXX/DYY==0 FOR
+     !!  LINEAR SEGMENTS POST NADIR !!!!!!!!!!!!!!!
+     !!########################################!!
+     nn=real(iline)
+     !now try line fitting for each post-nadir segment iline long
+     do ci=1,iflex-iline
+        sumx=0.0D00
+        sumxx=0.0D00
+        sumxy=0.0D00
+        sumy=0.0D00
+        minm=1.0D10
+        do k=0,iline-1
+           sumx=sumx+flexxx(k+ci)
+           sumy=sumy+flexyy(k+ci)
+           sumxx=sumxx+flexxx(k+ci)*flexxx(k+ci)
+           sumxy=sumxy+flexxx(k+ci)*flexyy(k+ci)
+        end do
+        m=(sumxy-(sumx*sumy/nn))/(sumxx-(sumx*sumx/nn))
+        flex_slope(ci)=m
+!!        print *,flex_slope(ci),ci
+     end do
+
+     !test if bulge, that is slope ~ 0 and Y at high value
+     peakyy=-1.0D00
+     do ci=2,iflex-iline-1
+        m1=flex_slope(ci-1)
+        m2=flex_slope(ci+1)
+        ! save any value where slope sign changes and  highest Y
+        if ( (m1 > 0.0) .and. (m2 < 0.0) .and. (peakyy < 0.0) ) then
+           im = ci-ioffset
+           minm=flex_slope(ci)
+           peakyy=flexyy(ci)
+        end if
+     end do
+
+     if (abs(minm) < min_slope) then 
+        linfitxx(fi)=flexxx(im)
+        linfityy(fi)=flexyy(im)
+     else
+        linfitxx(fi)=-1.01D02
+        linfityy(fi)=-1.01D02
+     end if   
+
+     write (28,2600) linfitxx(fi),linfityy(fi),flex_slope(im)
+     write (28,1010)
+     !!########################################!!
+     !!!!!!!!!!! END DXX/DYY==0!!!!!!!!!!!!!!!     
+     !!########################################!!
+
+     !!########################################!!
+     !!!!!!!!!!! RADIUS HOLDFAST !!!!!!!!!!!!!!!
+     !!########################################!!
+     ! save amplitude and length hold-fast
+     ! y=0 at begin fossil
+     x=newxx(fi,begin_fossil(fi))
+     ! x = 0 at nadir
+     y=newyy(fi,nadirs(fi))
+     radius=sqrt(x*x + y*y)
+     angle=atan(abs(y/x))*d2r
+     holdfast_radius(fi)=radius
+     
+     !      print *, "holdfast = ",radius,"angle = ",angle,"  deflection = ",y
+     write (13,1050) radius,angle,specimen(fi)
+     write (14,1050) radius,y,specimen(fi)
+     write (15,1040) bulgexx(fi),radius,y,specimen(fi)
+     write (29,1040) linfitxx(fi),radius,linfityy(fi),specimen(fi)
+     
+     ! Report on progress establishing baseline and nadir
+     write (*, 1060) fi,specimen(fi),m,konst,ibegin,mincol,iend,linfitxx(fi),a(4),a(3),a(2),a(1),&
+          &bulgexx(fi),dx1,dx2,ddx1,ddx2
+
+     ! WRITE BOTH ESTIMATES BULGE TO FILE
+     write (30, 1030) bulgexx(fi),linfitxx(fi),radius
+     !!########################################!!
+     !!!!!!!! END RADIUS HOLDFAST !!!!!!!!!!!!!!!
+     !!########################################!!
+
+     !! release memory
+     
+     deallocate(flexxx)
+     deallocate(flexyy)
+     
+  end do processfoss
+  !!########################################!!
+  !!!!!!!!!!! END PROCESS FOSSIL (FOSS) !!!!!!!
+  !!########################################!!
+
+  !!########################################!!
+  !!    OUTPUT BEGIN-START-END-BULGE      !!!!
+  !!########################################!!
+  ! now write output file
+  write_plot : do fi=1,foss
+     write (21,990) specimen(fi)
+     write (22,990) specimen(fi)
+     write (23,990) specimen(fi)
+     write (24,990) specimen(fi)
+     do ci=2,cols(fi)
+        select case (fossil(fi,ci))
+        case (0)
+           write (21,1000) newxx(fi,ci),newyy(fi,ci)
+        case (1)
+           write (22,1000) newxx(fi,ci),newyy(fi,ci)
+        case (-1)
+           write (23,1000) newxx(fi,ci),newyy(fi,ci)
+        end select
+     end do
+     write (24, 1000) newxx(fi,begin_fossil(fi)),newyy(fi,begin_fossil(fi))
+     write (24, 1000) newxx(fi,nadirs(fi)),newyy(fi,nadirs(fi))
+     !     write (24, 1000) newxx(fi,bulge(fi)),newyy(fi,bulge(fi))
+     write (24, 1000) bulgexx(fi), bulgeyy(fi)
+  end do write_plot
+  write (21,1010)
+  write (22,1010)
+  write (23,1010)
+  write (24,1010)
+  !!########################################!!
+  !!--!!!!!!! END  OUTPUT !!!!!!!!!!!!!!!
+  !!########################################!!
+
+  !!########################################!!
+  !--!!!!!!!! STACK FOSSILS !!!!!!!!!!!!!!
+  !!########################################!!
+  ! smooth curves
+  radii : do irad=1,6
+     !! zero counters and means
+     stacked(irad)=0
+     ibulge(irad)=0
+     minrad=bin_mid(irad)-rstep
+     maxrad=bin_mid(irad)+rstep
+     end_stacked(irad)=0.0D+00
+     begin_stacked(irad)=0.0D+00
+     mean_rad_stacked(irad)=0.0D+00
+     mean_bulge_stacked(irad)=0.0D+00
+     mean_flex_stacked(irad)=0.0D+00
+     select case (irad)
+     case(1)
+        write (12,1015) 
+     case(2)
+        write (12,1016)
+     case(3)
+        write (12,1017)
+     case(4)
+        write (12,1018)
+     case(5)
+        write (12,1019) 
+     case DEFAULT
+        write (12,1020)
+     end select
+     initialise : do i=1,cmax
+        smoothnn(i)=0.0
+        smoothxx(i)=0.0
+        smoothyy(i)=0.0
+     end do initialise
+     ! now count for a given radius range
+     smooth : do fi=1,foss
+        bins : if ( (holdfast_radius(fi) .LT. maxrad) .AND. (holdfast_radius(fi) .GE. minrad) ) then
+           !! means
+           stacked(irad)=stacked(irad)+1
+           end_stacked(irad)=end_stacked(irad)+newxx(fi,end_fossil(fi))
+           begin_stacked(irad)=begin_stacked(irad)+newxx(fi,begin_fossil(fi))
+           mean_rad_stacked(irad)=mean_rad_stacked(irad)+holdfast_radius(fi)
+           mean_flex_stacked(irad)=mean_flex_stacked(irad)+newyy(fi,nadirs(fi))
+           if (bulgexx(fi) > 0.0) then
+              ibulge(irad)=ibulge(irad)+1
+              mean_bulge_stacked(irad)=mean_bulge_stacked(irad)+bulgexx(fi)
+           end if
+           !!stack profiles
+           do ci=2,cols(fi)
+              !use x value as index, 200 added to keep positive
+              ix=200+int(newxx(fi,ci)+0.5)
+              smoothnn(ix)=smoothnn(ix)+1
+              smoothxx(ix)=smoothxx(ix)+newxx(fi,ci)     
+              smoothyy(ix)=smoothyy(ix)+newyy(fi,ci)
+           end do
+        end if bins
+     end do smooth
+     
+     do ci=1,cmax
+        if (smoothnn(ci) > 2) then
+           nn=real(smoothnn(ci))
+           !      print *, smoothxx(i)/nn,smoothyy(fi)/nn,smoothnn(fi)
+           write (12,1005) smoothxx(ci)/nn,smoothyy(ci)/nn,smoothnn(ci)
+        end if
+     end  do
+  end do radii
+  write (12,1010)
+
+  outside: do fi=1,foss
+     if ( (holdfast_radius(fi) < (bin_mid(1)-rstep) ) .OR. (holdfast_radius(fi) > (bin_mid(6)+rstep) ) ) then
+        excluded=excluded+1
+        write (*,1800) fi
+     end if
+  end do outside
+
+  !!report
+  do irad=1,6
+     minrad=bin_mid(irad)-rstep
+     maxrad=bin_mid(irad)+rstep
+     if (stacked(irad) > 0) then
+        end_stacked(irad) = end_stacked(irad)/real(stacked(irad))
+        mean_rad_stacked(irad) = mean_rad_stacked(irad)/real(stacked(irad))
+        begin_stacked(irad) = begin_stacked(irad)/real(stacked(irad))
+        mean_bulge_stacked(irad) = mean_bulge_stacked(irad)/real(ibulge(irad))
+        mean_flex_stacked(irad)=mean_flex_stacked(irad)/real(stacked(irad))
+        write (*,2700) stacked(irad),maxrad,minrad,begin_stacked(irad),&
+             & mean_rad_stacked(irad),end_stacked(irad),mean_bulge_stacked(irad),ibulge(irad),mean_flex_stacked(irad)
+        
+     else
+        write (*,2800) stacked(irad),maxrad,minrad
+     end if
+  end do
+  write (*,2900) excluded
+
+  !!########################################!!
+  !!-!!!!!!!! END STACK FOSSILS !!!!!!!!!!!!!!!
+  !!########################################!!
+
+  !!########################################!!
+  !!-!!!!!!!! FORMATS !!!!!!!!!!!!!!!
+  !!########################################!
+! formats
+990 format(">",1x,a10)
+1000 format(1x,f10.1,1x,f10.1)
+1005 format(1x,f10.1,1x,f10.1,3x,i4)
+1010 format(">")
+1015 format("> -W5,orange")
+1016 format("> -W5,red")     
+1017 format("> -W5,magenta") 
+1018 format("> -W5,purple")  
+1019 format("> -W5,blue")    
+1020 format("> -W5,green")
+!!1021 format("> -W5,slategrey")
+!!1022 format("> -W5,black")
+!!1023 format("> -W5")
+1030 format(1x,f10.1,1x,f10.1,1x,f10.1)
+1040 format(1x,f10.1,1x,f10.1,1x,f10.1,1x,a10)
+1050 format(1x,f10.1,1x,f10.1,4x,a10)
+1060 format (i2,1x,a6,1x,f6.2,1x,f6.2,1x,i3,1x,i3,1x,i3,1x,f8.2,4(1x,es10.1),1x,f8.2,1x,2(1x,f8.2),2(1x,f8.4))
+1065 format (" N",1x,"Fossil",1x," slope",1x,"Const.",1x,"Beg",1x,"Nad",1x,"End",1x,"  Linear",1x,&
+          &"      a",4x,"      b",4x,"      c",4x,"      d",4x," Polyfit  ",1x,"dy/dx=0a",1x,"dy/dx=0b",&
+          &1x,"ddy/dxxa",1x,"ddy/dxxb")
+1800 format (1x,"Profile ",i3,1x,"is out of range for stacking")
+2500 format (f10.1,1x,f10.1)
+2600 format (f10.3,1x,f10.3,1x,f10.5)
+2700 format (1x,i3," Curves stacked for Max=",f7.3,3x,"Min=",f7.3,3x,"Means: Start=",f7.3,1x,&
+          & "Radius=",f8.3,1x,"End=",1x,f7.3,1x,"Bulge=",f8.3,1x,i3,1x,"Bulges detected",1x,"Depression=",f8.3)
+2800 format(1x,i3," Curves stacked for Max=",f7.3,3x,"Min=",f7.3,3x," == NO RESULT ==")
+  2900 format (1x,i3," fossils out of range")
+!!3300 format("Means data ",f4.1,1x,i4,1x,i3,4(1x,f10.5))
+
+  !!########################################!!
+  !!-!!!!!!!! END FORMATS !!!!!!!!!!!!!!!
+  !!########################################! 
+  
+end program booley_baseline
